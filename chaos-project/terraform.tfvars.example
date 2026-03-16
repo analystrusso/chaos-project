@@ -1,0 +1,8 @@
+region              = "us-east-2"
+key_name            = "key_name"
+my_ip               = "my_public_ip"
+default_tags = {
+  project     = "chaos-engineering"
+  environment = "dev"
+  owner       = "yourname"
+}

@@ -1,0 +1,283 @@
+- name: Retrieve k3s join token from master
+  hosts: master
+  become: true
+  tasks:
+    - name: Wait for k3s to be ready
+      wait_for:
+        path: /var/lib/rancher/k3s/server/node-token
+        timeout: 120
+
+    - name: Read join token
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token_raw
+
+    - name: Set token fact
+      set_fact:
+        k3s_token: "{{ k3s_token_raw.content | b64decode | trim }}"
+        k3s_master_private_ip: "{{ ansible_default_ipv4.address }}"
+
+- name: Join workers to cluster
+  hosts: workers
+  become: true
+  vars:
+    master_ip: "{{ hostvars[groups['master'][0]]['k3s_master_private_ip'] }}"
+    k3s_token: "{{ hostvars[groups['master'][0]]['k3s_token'] }}"
+  tasks:
+    - name: Install k3s agent
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        K3S_URL=https://{{ master_ip }}:6443 \
+        K3S_TOKEN={{ k3s_token }} \
+        sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Wait for k3s agent to be active
+      systemd:
+        name: k3s-agent
+        state: started
+        enabled: true
+
+- name: Verify cluster health
+  hosts: master
+  become: true
+  tasks:
+    - name: Wait for all nodes to be Ready
+      shell: k3s kubectl get nodes | grep -c Ready
+      register: ready_nodes
+      until: ready_nodes.stdout | int == 3
+      retries: 24
+      delay: 10
+
+- name: Install Helm
+  hosts: master
+  become: true
+  tasks:
+    - name: Download Helm install script
+      get_url:
+        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        dest: /tmp/get-helm.sh
+        mode: '0700'
+
+    - name: Run Helm install script
+      shell: /tmp/get-helm.sh
+      args:
+        creates: /usr/local/bin/helm
+
+- name: Deploy Prometheus and Grafana
+  hosts: master
+  become: true
+  tasks:
+    - name: Add prometheus-community Helm repo
+      shell: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      register: repo_add
+      changed_when: "'already exists' not in repo_add.stdout"
+
+    - name: Update Helm repos
+      shell: helm repo update
+
+    - name: Install kube-prometheus-stack
+      shell: |
+        helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+          --namespace monitoring \
+          --create-namespace \
+          --kubeconfig /etc/rancher/k3s/k3s.yaml
+      args:
+        creates: /tmp/prometheus-installed
+
+    - name: Wait for Prometheus to be ready
+      shell: |
+        k3s kubectl wait --for=condition=ready pod \
+          -l app.kubernetes.io/name=prometheus \
+          -n monitoring \
+          --timeout=120s
+
+- name: Install Chaos Mesh
+  hosts: master
+  become: true
+  tasks:
+    - name: Add Chaos Mesh Helm repo
+      shell: helm repo add chaos-mesh https://charts.chaos-mesh.org
+      register: repo_add
+      changed_when: "'already exists' not in repo_add.stdout"
+
+    - name: Update Helm repos
+      shell: helm repo update
+
+    - name: Install Chaos Mesh
+      shell: |
+        helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
+          --namespace chaos-mesh \
+          --create-namespace \
+          --set chaosDaemon.runtime=containerd \
+          --set chaosDaemon.socketPath=/run/k3s/containerd/containerd.sock \
+          --kubeconfig /etc/rancher/k3s/k3s.yaml
+      args:
+        creates: /tmp/chaos-mesh-installed
+
+    - name: Wait for Chaos Mesh pods to be ready
+      shell: |
+        k3s kubectl wait --for=condition=ready pod \
+          -l app.kubernetes.io/instance=chaos-mesh \
+          -n chaos-mesh \
+          --timeout=120s
+      retries: 3
+      delay: 15
+
+
+- name: Deploy target application
+  hosts: master
+  become: true
+  tasks:
+    - name: Apply target-app deployment
+      shell: |
+        cat <<EOF | k3s kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: target-app
+          namespace: default
+        spec:
+          replicas: 3
+          selector:
+            matchLabels:
+              app: target-app
+          template:
+            metadata:
+              labels:
+                app: target-app
+            spec:
+              containers:
+                - name: nginx
+                  image: nginx:latest
+                  ports:
+                    - containerPort: 80
+                  resources:
+                    requests:
+                      cpu: 10m
+                      memory: 64Mi
+                    limits:
+                      cpu: 50m
+                      memory: 128Mi
+              topologySpreadConstraints:
+                - maxSkew: 1
+                  topologyKey: kubernetes.io/hostname
+                  whenUnsatisfiable: DoNotSchedule
+                  labelSelector:
+                    matchLabels:
+                      app: target-app
+        EOF
+
+    - name: Apply HPA for target-app
+      shell: |
+        cat <<EOF | k3s kubectl apply -f -
+        apiVersion: autoscaling/v2
+        kind: HorizontalPodAutoscaler
+        metadata:
+          name: target-app-hpa
+          namespace: default
+        spec:
+          scaleTargetRef:
+            apiVersion: apps/v1
+            kind: Deployment
+            name: target-app
+          minReplicas: 3
+          maxReplicas: 9
+          metrics:
+            - type: Resource
+              resource:
+                name: cpu
+                target:
+                  type: Utilization
+                  averageUtilization: 50
+        EOF
+
+    - name: Apply target-app service
+      shell: |
+        cat <<EOF | k3s kubectl apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: target-app
+          namespace: default
+        spec:
+          selector:
+            app: target-app
+          ports:
+            - port: 80
+              targetPort: 80
+          type: ClusterIP
+        EOF
+
+    - name: Wait for target-app to be ready
+      shell: |
+        k3s kubectl rollout status deployment/target-app \
+          --namespace default \
+          --timeout=60s
+
+
+- name: Deploy k6 load generator
+  hosts: master
+  become: true
+  tasks:
+    - name: Create k6 test script ConfigMap
+      shell: |
+        cat <<EOF | k3s kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: k6-script
+          namespace: default
+        data:
+          script.js: |
+            import http from 'k6/http';
+            import { sleep, check } from 'k6';
+            export const options = {
+              stages: [
+                { duration: '1m', target: 10},
+                { duration: '2m', target: 100},
+                { duration: '5m', target: 100},
+                { duration: '1m', target: 10}
+              ],
+            };
+            export default function () {
+              const res = http.get('http://target-app');
+              check(res, {
+                'status is 200': (r) => r.status === 200,
+              });
+              sleep(1);
+            }
+        EOF
+
+    - name: Deploy k6 load generator
+      shell: |
+        cat <<EOF | k3s kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: k6-load-generator
+          namespace: default
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: k6
+          template:
+            metadata:
+              labels:
+                app: k6
+            spec:
+              containers:
+                - name: k6
+                  image: grafana/k6:latest
+                  args: ["run", "/scripts/script.js"]
+                  volumeMounts:
+                    - name: k6-script
+                      mountPath: /scripts
+              volumes:
+                - name: k6-script
+                  configMap:
+                    name: k6-script
+        EOF
+

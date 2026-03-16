@@ -290,6 +290,21 @@ stages: [
 
 ---
 
+
+### Experiment 3: Traffic Latency Injection
+
+**Hypothesis:** When 200ms of artificial latency is injected on target-app pods, the application remains available and k6 maintains a near-zero error rate, but p99 response latency increases proportionally.
+
+**Method:** Chaos Mesh injected 200ms of network latency with 20ms jitter and 25% correlation on all target-app pods for 5 minutes. k6 ran continuously at 50 VUs throughout, measuring the impace on response times and error rate. Jitter and correlation were included to more realistically model real-world network conditions rather than a flat artificial delay.
+
+**Result: CONFIRMED**
+- Baseline avg response time: ~6ms
+- Response time under 200ms injection: avg 154ms, p95 246ms
+- Error rate during injection: 0.04% (14/34803 requests)
+- Application remained available throughout
+
+---
+
 ## Known Limitations and Gotchas
 
 **Inventory IPs change on every terraform apply.** There is no dynamic inventory configured. Update `ansible/inventory.ini` manually after each `terraform apply`. A future improvement would use Ansible's AWS EC2 dynamic inventory plugin.

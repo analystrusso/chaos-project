@@ -295,7 +295,43 @@ stages: [
 
 **Hypothesis:** When 200ms of artificial latency is injected on target-app pods, the application remains available and k6 maintains a near-zero error rate, but p99 response latency increases proportionally.
 
-**Method:** Chaos Mesh injected 200ms of network latency with 20ms jitter and 25% correlation on all target-app pods for 5 minutes. k6 ran continuously at 50 VUs throughout, measuring the impace on response times and error rate. Jitter and correlation were included to more realistically model real-world network conditions rather than a flat artificial delay.
+**Method:** Chaos Mesh injected 200ms of network latency with 50ms jitter and 25% correlation on all target-app pods for 5 minutes. k6 ran continuously at 50 VUs throughout, measuring the impace on response times and error rate. Jitter and correlation were included to more realistically model real-world network conditions rather than a flat artificial delay.
+
+```
+mkdir -p /home/ubuntu/experiments
+cat <<EOF > /home/ubuntu/experiments/network-latency-01.yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: network-latency-01
+  namespace: chaos-mesh
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - default
+    labelSelectors:
+      app: target-app
+  delay:
+    latency: 200ms
+    correlation: "25"
+    jitter: 50ms
+  duration: 5m
+EOF
+```
+Verify k6 is running before injecting:
+```bash
+sudo k3s kubectl logs -l app=k6 -n default --tail=5
+```
+Apply the experiment
+```bash
+sudo k3s kubectl apply -f /home/ubuntu/experiments/network-latency-01.yaml
+```
+The experiment runs for 5 minutes before quitting automatically. Results are captured in the k6 summary output after completion.
+```bash
+sudo k3s kubectl logs -l app=k6 -n default --tail=50
+```
 
 **Result: CONFIRMED**
 - Baseline avg response time: ~6ms

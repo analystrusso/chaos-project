@@ -282,7 +282,7 @@ stages: [
 
 **Result: CONFIRMED**
 - HPA triggered scaling at ~50% CPU utilization
-- Replica count increased from 3 to 4 during sustained load
+- Replica count increased from 3 to 6 during sustained load
 - System scaled back to 3 replicas after ~5 minute stabilization window
 - No errors observed during scale-up or scale-down
 
